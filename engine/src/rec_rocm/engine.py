@@ -29,10 +29,11 @@ class Engine:
         implementation="blas",
     ):
         directory, manifest_path = Path(directory), Path(manifest_path)
-        device = validate_platform()
+        device, platform = validate_platform()
         self.identity = validate(directory, manifest_path)
-        if not 1 <= context_limit <= min(33536, self.identity["max_context"]):
-            raise ValueError("ROCm context limit must be between 1 and 33536")
+        limit = min(platform.max_context, self.identity["max_context"])
+        if not 1 <= context_limit <= limit:
+            raise ValueError(f"ROCm context limit must be between 1 and {limit}")
         self.context_limit = context_limit
         self.prefill_chunk = prefill_chunk
         self.use_graph = graph
@@ -49,7 +50,7 @@ class Engine:
             "device": device.name,
             "architecture": device.gcnArchName.split(":")[0],
             "logical_device": 0,
-            "kv_format": "bf16",
+            "kv_format": "bf16" if self.model.gfx1151_kv == "bf16" else "bf16-window_mlx-k8v4-full",
             "weight_format": self.identity["weight_format"],
             "load_seconds": self.model.load_seconds,
             "engine": "rocm",
@@ -59,14 +60,25 @@ class Engine:
                 name: getattr(self.model, "rdna4_" + name)
                 for name in ("expert", "attention", "prefill", "norm", "rope", "graph", "pv")
             },
+            "gfx1151_options": {
+                "decode": self.model.gfx1151_decode,
+                "attention": self.model.gfx1151_attention,
+                "prefill": self.model.gfx1151_prefill,
+                "kv": self.model.gfx1151_kv,
+                "gemv": self.model.gfx1151_gemv,
+                "prefill_attention": self.model.gfx1151_prefill_attention,
+            },
             "dense_cache_bytes": sum(
                 t.numel() * t.element_size() for t in self.model.dense_cache.values()
             ),
             "prefill_attention_query_rows": self.model.attention_query_rows,
             "prefill_attention_tile_threshold": self.model.attention_tile_threshold,
-            "activation_profile": "bf16-blas-projections_fp32-attention_bf16-kv"
-            if implementation == "blas"
-            else "experimental-fp32-triton_bf16-kv",
+            "activation_profile": (
+                "bf16-blas-projections_fp32-attention"
+                if implementation == "blas"
+                else "experimental-fp32-triton"
+            )
+            + ("_bf16-kv" if self.model.gfx1151_kv == "bf16" else "_k8v4-full-kv"),
         }
 
     @property

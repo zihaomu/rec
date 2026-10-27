@@ -35,12 +35,40 @@ def rope(x, positions, theta=10000.0, angles=None):
 
 
 class LayerCache:
-    def __init__(self, capacity, kvheads, dim, window=None, device="cuda"):
+    def __init__(self, capacity, kvheads, dim, window=None, device="cuda", quantized=False):
         self.window = window
         self.capacity = min(capacity, window) if window else capacity
-        self.key = torch.zeros((self.capacity, kvheads, dim), device=device, dtype=torch.bfloat16)
-        self.value = torch.zeros_like(self.key)
+        # rec_mlx's MixedQuantizedKVCache: 8-bit keys, 4-bit values, group 64, BF16 metadata.
+        self.quantized = quantized
+        if quantized:
+            groups = (self.capacity, kvheads, dim // 64)
+            self.key = torch.zeros((self.capacity, kvheads, dim), device=device, dtype=torch.uint8)
+            self.value = torch.zeros(
+                (self.capacity, kvheads, dim // 2), device=device, dtype=torch.uint8
+            )
+            self.key_scale, self.key_bias, self.value_scale, self.value_bias = (
+                torch.zeros(groups, device=device, dtype=torch.bfloat16) for _ in range(4)
+            )
+        else:
+            self.key = torch.zeros(
+                (self.capacity, kvheads, dim), device=device, dtype=torch.bfloat16
+            )
+            self.value = torch.zeros_like(self.key)
         self.positions = torch.full((self.capacity,), -1, device=device, dtype=torch.int32)
+
+    @property
+    def tensors(self):
+        if self.quantized:
+            return (
+                self.key,
+                self.value,
+                self.positions,
+                self.key_scale,
+                self.key_bias,
+                self.value_scale,
+                self.value_bias,
+            )
+        return self.key, self.value, self.positions
 
     def reset(self):
         self.positions.fill_(-1)
@@ -52,22 +80,48 @@ class LayerCache:
                 value[-self.capacity :],
                 positions[-self.capacity :],
             )
-        if native:
+        if native and not self.quantized:
             ops.write_cache(key, value, positions, self)
             return
         if self.window:
             slots = positions.long() % self.capacity
         else:
             slots = positions.long()
-        self.key.index_copy_(0, slots, key)
-        self.value.index_copy_(0, slots, value)
+        if self.quantized:
+            from .gfx1151 import kv_quantize
+
+            parts = (*kv_quantize(key, 8), *kv_quantize(value, 4))
+            caches = (
+                self.key,
+                self.key_scale,
+                self.key_bias,
+                self.value,
+                self.value_scale,
+                self.value_bias,
+            )
+            for cache, part in zip(caches, parts, strict=True):
+                cache.index_copy_(0, slots, part)
+        else:
+            self.key.index_copy_(0, slots, key)
+            self.value.index_copy_(0, slots, value)
         self.positions.index_copy_(0, slots, positions)
 
+    def dense(self, end, dtype):
+        """Dequantized keys and values of the first `end` slots."""
+        from .gfx1151 import kv_dequantize
+
+        return (
+            kv_dequantize(self.key[:end], self.key_scale[:end], self.key_bias[:end], 8, dtype),
+            kv_dequantize(
+                self.value[:end], self.value_scale[:end], self.value_bias[:end], 4, dtype
+            ),
+        )
+
     def snapshot(self):
-        return tuple(t.clone() for t in (self.key, self.value, self.positions))
+        return tuple(t.clone() for t in self.tensors)
 
     def restore(self, state):
-        for dest, source in zip((self.key, self.value, self.positions), state, strict=True):
+        for dest, source in zip(self.tensors, state, strict=True):
             dest.copy_(source)
 
 
@@ -88,6 +142,58 @@ class FlintModel:
         self.rdna4_norm = os.environ.get("REC_RDNA4_NORM", "off")
         self.rdna4_rope = os.environ.get("REC_RDNA4_ROPE", "off")
         self.rdna4_graph = os.environ.get("REC_RDNA4_GRAPH", "off")
+        self.gfx1151_decode = os.environ.get("REC_GFX1151_DECODE", "off")
+        self.gfx1151_attention = os.environ.get("REC_GFX1151_ATTENTION", "off")
+        self.gfx1151_prefill = os.environ.get("REC_GFX1151_PREFILL", "off")
+        self.gfx1151_kv = os.environ.get("REC_GFX1151_KV", "bf16")
+        self.gfx1151_gemv = os.environ.get("REC_GFX1151_GEMV", "off")
+        self.gfx1151_prefill_attention = os.environ.get("REC_GFX1151_PREFILL_ATTENTION", "off")
+        if self.gfx1151_kv not in ("bf16", "k8v4"):
+            raise ValueError("Unknown REC_GFX1151_KV")
+        if self.gfx1151_prefill not in ("off", "grouped"):
+            raise ValueError("Unknown REC_GFX1151_PREFILL")
+        if self.gfx1151_prefill != "off" and self.rdna4_prefill != "off":
+            raise ValueError("REC_GFX1151_PREFILL replaces REC_RDNA4_PREFILL")
+        if self.gfx1151_prefill_attention not in ("off", "fused"):
+            raise ValueError("Unknown REC_GFX1151_PREFILL_ATTENTION")
+        if self.gfx1151_prefill_attention != "off" and self.rdna4_attention in ("all", "mask"):
+            raise ValueError("REC_GFX1151_PREFILL_ATTENTION replaces REC_RDNA4_ATTENTION=all/mask")
+        if self.gfx1151_attention not in ("off", "split", "hip"):
+            raise ValueError("Unknown REC_GFX1151_ATTENTION")
+        if self.gfx1151_attention != "off" and self.gfx1151_decode != "layer":
+            raise ValueError("REC_GFX1151_ATTENTION requires REC_GFX1151_DECODE=layer")
+        if self.gfx1151_decode not in ("off", "fused", "layer"):
+            raise ValueError("Unknown REC_GFX1151_DECODE")
+        if self.gfx1151_decode == "layer" and (
+            self.rdna4_norm,
+            self.rdna4_rope,
+            self.rdna4_expert,
+        ) != ("off", "off", "off"):
+            raise ValueError(
+                "REC_GFX1151_DECODE=layer replaces the RDNA4 norm, RoPE and expert paths"
+            )
+        if (
+            self.gfx1151_decode != "off"
+            and not reference
+            and torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] != "gfx1151"
+        ):
+            raise ValueError("REC_GFX1151_DECODE is qualified only on gfx1151")
+        if self.gfx1151_gemv not in ("off", "hip"):
+            raise ValueError("Unknown REC_GFX1151_GEMV")
+        if self.gfx1151_gemv != "off" and self.gfx1151_decode != "layer":
+            raise ValueError("REC_GFX1151_GEMV requires REC_GFX1151_DECODE=layer")
+        if self.gfx1151_gemv == "hip" and not reference:
+            from . import hip
+
+            hip.load("gemv")
+        if self.gfx1151_attention == "hip":
+            # HIP for the k8v4 full-attention layers; BF16 window layers keep the Triton split.
+            if self.gfx1151_kv != "k8v4":
+                raise ValueError("REC_GFX1151_ATTENTION=hip needs REC_GFX1151_KV=k8v4")
+            if not reference:
+                from . import hip
+
+                hip.load("attention")
         if self.rdna4_expert not in ("off", "simd", "wmma"):
             raise ValueError("Unknown REC_RDNA4_EXPERT")
         if self.rdna4_attention not in ("off", "decode", "all", "mask"):
@@ -155,6 +261,8 @@ class FlintModel:
                         continue
                     self.dense_cache[path] = ops.dequantize(w, s, b, dtype=self.activation_dtype)
                     cached_bytes += needed
+        if self.gfx1151_kv == "k8v4" and self.config["head_dim"] % 64:
+            raise ValueError("REC_GFX1151_KV=k8v4 needs head_dim divisible by the group size 64")
         self.caches = [
             LayerCache(
                 capacity,
@@ -162,6 +270,7 @@ class FlintModel:
                 self.config["head_dim"],
                 None if kind == "full_attention" else self.config["sliding_window"],
                 device,
+                quantized=kind == "full_attention" and self.gfx1151_kv == "k8v4",
             )
             for kind in self.config["layer_types"]
         ]
@@ -171,6 +280,7 @@ class FlintModel:
         self.attention_tile_threshold = 8192
         self.graph_mode = False
         self.graph_position = torch.zeros((1,), device=self.device, dtype=torch.int32)
+        self._qkv = None
         self.load_seconds = time.perf_counter() - started
         self.last_trace = []
 
@@ -236,6 +346,21 @@ class FlintModel:
 
     def linear(self, x, path, ids=None, layout=None, x_assignments=False):
         w, s, b = [self.weights[path + "." + name] for name in ("weight", "scales", "biases")]
+        if (
+            self.gfx1151_decode != "off"
+            and not self.reference
+            and (x.shape[0] == 1 or (x_assignments and ids is not None and ids.shape[0] == 1))
+        ):
+            from .gfx1151 import gemv_w4
+
+            return gemv_w4(
+                x.contiguous(),
+                w,
+                s,
+                b,
+                ids=ids.flatten() if ids is not None else None,
+                x_expert=x_assignments,
+            )
         if not self.reference and ids is not None:
             if ids.shape[0] == 1 and self.rdna4_expert != "off":
                 if self.rdna4_expert == "wmma":
@@ -386,6 +511,19 @@ class FlintModel:
         return values[flat, rank]
 
     def mlp(self, x, path, ids=None, layout=None):
+        if (
+            ids is not None
+            and ids.shape[0] > 16
+            and self.gfx1151_prefill == "grouped"
+            and not self.reference
+        ):
+            from .gfx1151 import moe_prefill
+
+            weights = [
+                [self.weights[f"{path}.{n}_proj.{part}"] for part in ("weight", "scales", "biases")]
+                for n in ("gate", "up", "down")
+            ]
+            return moe_prefill(x, *weights, ids)
         gate = self.linear(x, path + ".gate_proj", ids, layout)
         up = self.linear(x, path + ".up_proj", ids, layout)
         act = F.silu(gate) * up
@@ -403,6 +541,8 @@ class FlintModel:
                 self.position, self.position + count, device=self.device, dtype=torch.int32
             )
         )
+        if count == 1 and self.gfx1151_decode == "layer" and not self.reference:
+            return self._forward_decode_layer(tokens, positions, trace)
         emb = [self.weights["model.embed_tokens." + n] for n in ("weight", "scales", "biases")]
         if self.reference:
             selected = [t.index_select(0, tokens.long()) for t in emb]
@@ -455,73 +595,12 @@ class FlintModel:
                 if not cache.window and count > 1:
                     end = self.position + count
                     ak, av, ap = ak[:end], av[:end], ap[:end]
-            sinks = self.weights[p + ".self_attn.softmax_offset"].float()
-            if not self.reference and (
-                self.rdna4_attention == "all" or (self.rdna4_attention == "decode" and count == 1)
-            ):
-                from .rdna4 import sink_attention
-
-                attention = sink_attention(q, ak, av, sinks, positions, ap, cache.window)
-            elif (
-                not self.reference
-                and self.implementation in ("blas", "hybrid")
-                and not cache.window
-                and count > self.attention_query_rows
-                and ak.shape[0] > self.attention_tile_threshold
-            ):
-                attention = query_tiled_attention(
-                    q, ak, av, sinks, positions, ap, self.attention_query_rows
-                )
-            elif self.reference or self.implementation in ("blas", "hybrid"):
-                repeats = c["num_attention_heads"] // c["num_key_value_heads"]
-                score = torch.einsum(
-                    "mkhd,nkd->khmn",
-                    q.float().view(count, c["num_key_value_heads"], repeats, c["head_dim"]),
-                    ak.float(),
-                ).reshape(c["num_attention_heads"], count, ak.shape[0]) / math.sqrt(c["head_dim"])
-                if self.rdna4_attention == "mask" and not self.reference:
-                    from .rdna4 import mask_sink
-
-                    score = mask_sink(score, sinks, positions, ap, cache.window)
-                else:
-                    allowed = (ap[None] <= positions[:, None]) & (ap[None] >= 0)
-                    if cache.window:
-                        allowed &= ap[None] > positions[:, None] - cache.window
-                    score = score.masked_fill(~allowed[None], -float("inf"))
-                    score = torch.cat((score, sinks[:, None, None].expand(-1, count, 1)), -1)
-                probs = torch.softmax(score, -1)[..., : ak.shape[0]]
-                del score
-                if (
-                    self.rdna4_pv == "ordered"
-                    and count == 1
-                    and c["head_dim"] == 128
-                    and not self.reference
-                ):
-                    from .ordered_attention import decode_pv
-
-                    attention = decode_pv(probs, av, positions, window=cache.window)
-                else:
-                    attention = (
-                        torch.einsum(
-                            "khmn,nkd->mkhd",
-                            probs.view(c["num_key_value_heads"], repeats, count, ak.shape[0]),
-                            av.float(),
-                        )
-                        .reshape(count, c["num_attention_heads"], c["head_dim"])
-                        .to(x.dtype)
+                if cache.quantized:
+                    # As rec_mlx: prefill attends to BF16-dequantized K/V; decode does not round them.
+                    ak, av = cache.dense(
+                        ap.shape[0], torch.float32 if count == 1 else torch.bfloat16
                     )
-                del probs
-            else:
-                attention = ops.attention(
-                    q.contiguous(),
-                    ak.contiguous(),
-                    av.contiguous(),
-                    sinks,
-                    positions,
-                    ap,
-                    cache.window,
-                    dtype=x.dtype,
-                )
+            attention = self._attend(q, ak, av, ap, positions, cache, p, count, x.dtype)
             if cache.window and count > 1:
                 cache.update(key, value, positions, native=not self.reference)
             x = x + self.linear(attention.reshape(count, -1), p + ".self_attn.o_proj")
@@ -539,9 +618,10 @@ class FlintModel:
                 ].contiguous()
                 scores = route.gather(-1, ids)
                 scores = (scores / (scores.sum(-1, keepdim=True) + 1e-20)).to(h.dtype)
+                grouped = count > 16 and self.gfx1151_prefill == "grouped" and not self.reference
                 layout = (
                     self.blas_layout(ids, c["num_experts"])
-                    if count > 16 and self.implementation in ("blas", "hybrid")
+                    if count > 16 and self.implementation in ("blas", "hybrid") and not grouped
                     else (
                         None
                         if count == 1 or self.reference or self.implementation in ("blas", "hybrid")
@@ -561,6 +641,178 @@ class FlintModel:
         if self.graph_mode:
             self.graph_position.add_(1)
         return logits
+
+    def _forward_decode_layer(self, tokens, positions, trace):
+        """Single-token forward with fused gfx1151 kernels; attention scores and PV use _attend."""
+        from . import gfx1151 as g
+        from . import hip
+
+        mv = hip if self.gfx1151_gemv == "hip" else g
+        c = self.config
+        eps = c["rms_norm_eps"]
+        heads, kv_heads, dim = c["num_attention_heads"], c["num_key_value_heads"], c["head_dim"]
+        if self._qkv is None:
+            self._qkv = [
+                [
+                    torch.cat(
+                        [self.weights[f"model.layers.{i}.self_attn.{n}_proj.{part}"] for n in "qkv"]
+                    )
+                    for part in ("weight", "scales", "biases")
+                ]
+                for i in range(c["num_hidden_layers"])
+            ]
+            half = dim // 2
+            self._rope_freq = c["rope_theta"] ** (
+                -torch.arange(half, device=self.device, dtype=torch.float32) / half
+            )
+        angle = positions.float()[:, None] * self._rope_freq[None]
+        rotation = angle.cos().flatten(), angle.sin().flatten()
+        emb = [self.weights["model.embed_tokens." + n] for n in ("weight", "scales", "biases")]
+        x = ops.embedding(tokens, *emb, dtype=self.activation_dtype)
+        self.last_trace = []
+        for i, cache in enumerate(self.caches):
+            p = f"model.layers.{i}"
+            w = self.weights
+            h = g.rms_norm(x, w[p + ".input_layernorm.weight"], eps)
+            qkv = mv.gemv_w4(h, *self._qkv[i])
+            q = g.qk_post(
+                qkv,
+                w[p + ".self_attn.q_norm.weight"],
+                w[p + ".self_attn.k_norm.weight"],
+                None if i in c["no_rope_layer_indices"] else rotation,
+                cache,
+                positions,
+                eps,
+                heads,
+                kv_heads,
+                dim,
+            )
+            ak, av, ap = cache.key, cache.value, cache.positions
+            if not cache.window:
+                extent = self.decode_attention_capacity
+                ak, av, ap = ak[:extent], av[:extent], ap[:extent]
+            if self.gfx1151_attention != "off" and cache.quantized:
+                sinks = self.weights[p + ".self_attn.softmax_offset"]
+                fused = hip if self.gfx1151_attention == "hip" else g
+                attention = fused.sink_attention_k8v4(q, cache, extent, positions, sinks)
+            elif self.gfx1151_attention != "off":
+                sinks = self.weights[p + ".self_attn.softmax_offset"]
+                attention = g.sink_attention(q, ak, av, positions, ap, sinks, cache.window)
+            else:
+                if cache.quantized:
+                    ak, av = cache.dense(extent, torch.float32)
+                attention = self._attend(q, ak, av, ap, positions, cache, p, 1, x.dtype)
+            o = [w[p + ".self_attn.o_proj." + n] for n in ("weight", "scales", "biases")]
+            x = mv.gemv_w4(attention.reshape(1, -1), *o, residual=x)
+            h = g.rms_norm(x, w[p + ".post_attention_layernorm.weight"], eps)
+            if i in c["mlp_only_layers"]:
+                mlp = p + ".mlp"
+                gate, up, down = [
+                    [w[f"{mlp}.{n}_proj.{part}"] for part in ("weight", "scales", "biases")]
+                    for n in ("gate", "up", "down")
+                ]
+                x = mv.gemv_w4(mv.gate_up_w4(h, *gate, *up), *down, residual=x)
+            else:
+                ids, scores = g.route(
+                    h,
+                    w[p + ".mlp.gate.weight"],
+                    w[p + ".mlp.gate.expert_bias"],
+                    c["num_experts_per_tok"],
+                )
+                routed, shared = p + ".mlp.switch_mlp", p + ".mlp.shared_expert"
+                rg, ru, rd, sg, su, sd = [
+                    [w[f"{base}.{n}_proj.{part}"] for part in ("weight", "scales", "biases")]
+                    for base in (routed, shared)
+                    for n in ("gate", "up", "down")
+                ]
+                act = mv.gate_up_w4(h, *rg, *ru, ids=ids)
+                shared_act = mv.gate_up_w4(h, *sg, *su)
+                x = mv.down_combine_w4(act, *rd, ids, scores, shared_act, *sd, x)
+            if trace:
+                self.last_trace.append(x.clone())
+        self.position += 1
+        h = g.rms_norm(x, self.weights["model.norm.weight"], eps)
+        logits = mv.gemv_w4(
+            h, *[self.weights["lm_head." + n] for n in ("weight", "scales", "biases")]
+        ).float()
+        if self.graph_mode:
+            self.graph_position.add_(1)
+        return logits
+
+    def _attend(self, q, ak, av, ap, positions, cache, p, count, dtype):
+        c = self.config
+        sinks = self.weights[p + ".self_attn.softmax_offset"].float()
+        if count > 1 and self.gfx1151_prefill_attention == "fused" and not self.reference:
+            from .gfx1151 import prefill_attention
+
+            return prefill_attention(q, ak, av, positions, ap, sinks, cache.window, dtype)
+        if not self.reference and (
+            self.rdna4_attention == "all" or (self.rdna4_attention == "decode" and count == 1)
+        ):
+            from .rdna4 import sink_attention
+
+            attention = sink_attention(q, ak, av, sinks, positions, ap, cache.window)
+        elif (
+            not self.reference
+            and self.implementation in ("blas", "hybrid")
+            and not cache.window
+            and count > self.attention_query_rows
+            and ak.shape[0] > self.attention_tile_threshold
+        ):
+            attention = query_tiled_attention(
+                q, ak, av, sinks, positions, ap, self.attention_query_rows
+            )
+        elif self.reference or self.implementation in ("blas", "hybrid"):
+            repeats = c["num_attention_heads"] // c["num_key_value_heads"]
+            score = torch.einsum(
+                "mkhd,nkd->khmn",
+                q.float().view(count, c["num_key_value_heads"], repeats, c["head_dim"]),
+                ak.float(),
+            ).reshape(c["num_attention_heads"], count, ak.shape[0]) / math.sqrt(c["head_dim"])
+            if self.rdna4_attention == "mask" and not self.reference:
+                from .rdna4 import mask_sink
+
+                score = mask_sink(score, sinks, positions, ap, cache.window)
+            else:
+                allowed = (ap[None] <= positions[:, None]) & (ap[None] >= 0)
+                if cache.window:
+                    allowed &= ap[None] > positions[:, None] - cache.window
+                score = score.masked_fill(~allowed[None], -float("inf"))
+                score = torch.cat((score, sinks[:, None, None].expand(-1, count, 1)), -1)
+            probs = torch.softmax(score, -1)[..., : ak.shape[0]]
+            del score
+            if (
+                self.rdna4_pv == "ordered"
+                and count == 1
+                and c["head_dim"] == 128
+                and not self.reference
+            ):
+                from .ordered_attention import decode_pv
+
+                attention = decode_pv(probs, av, positions, window=cache.window)
+            else:
+                attention = (
+                    torch.einsum(
+                        "khmn,nkd->mkhd",
+                        probs.view(c["num_key_value_heads"], repeats, count, ak.shape[0]),
+                        av.float(),
+                    )
+                    .reshape(count, c["num_attention_heads"], c["head_dim"])
+                    .to(dtype)
+                )
+            del probs
+        else:
+            attention = ops.attention(
+                q.contiguous(),
+                ak.contiguous(),
+                av.contiguous(),
+                sinks,
+                positions,
+                ap,
+                cache.window,
+                dtype=dtype,
+            )
+        return attention
 
     def reset(self):
         self.position = 0
@@ -594,14 +846,7 @@ class GraphDecoder:
             state = []
             for cache in model.caches:
                 slot = initial % cache.capacity if cache.window else initial
-                state.append(
-                    (
-                        slot,
-                        cache.key[slot].clone(),
-                        cache.value[slot].clone(),
-                        cache.positions[slot].clone(),
-                    )
-                )
+                state.append((slot, [t[slot].clone() for t in cache.tensors]))
         else:
             state = model.snapshot()
 
@@ -609,10 +854,9 @@ class GraphDecoder:
             if compact:
                 model.position = initial
                 model.graph_position.fill_(initial)
-                for cache, (slot, key, value, position) in zip(model.caches, saved, strict=True):
-                    cache.key[slot].copy_(key)
-                    cache.value[slot].copy_(value)
-                    cache.positions[slot].copy_(position)
+                for cache, (slot, parts) in zip(model.caches, saved, strict=True):
+                    for tensor, part in zip(cache.tensors, parts, strict=True):
+                        tensor[slot].copy_(part)
             else:
                 model.restore(saved)
 
